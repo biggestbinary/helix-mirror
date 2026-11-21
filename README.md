@@ -66,6 +66,7 @@ Both scripts are safe to run again and again. Work that is already done gets ski
 
 ## Safety rules
 
+- Mirrors are created with a blank description.
 - A mirror is only pushed to after it is confirmed **private**, with no GitHub
   Pages site and with GitHub Actions turned off.
 - If a mirror ever stops being private, the scripts stop syncing it and
@@ -73,8 +74,6 @@ Both scripts are safe to run again and again. Work that is already done gets ski
 - The scripts never force-push, merge or delete anything. If a branch has
   changed on both Helix and GSA, it is reported as `DIVERGED` and skipped. A
   person needs to decide what to do with it.
-- If a repository named `GSA/falcon-<repo>` already exists but is a mirror of
-  a different Helix repo, the scripts refuse to use it.
 - Any repository with a file over 100 MB is refused. GitHub.com rejects those files.
 
 ## Naming

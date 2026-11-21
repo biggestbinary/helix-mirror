@@ -487,8 +487,7 @@ for spec in "${REPO_ARGS[@]}"; do
         fi
     else
         log "    creating private repo $dest_full"
-        if ! GH_HOST="$DEST_HOST" gh repo create "$dest_full" --private \
-                --description "Mirror of $SOURCE_HOST/$src_org/$src_repo" >>"$repo_log" 2>&1; then
+        if ! GH_HOST="$DEST_HOST" gh repo create "$dest_full" --private >>"$repo_log" 2>&1; then
             log "    gh repo create output:"
             sed 's/^/        /' "$repo_log" | tail -10
             repo_failed "gh repo create failed (token may lack org repo-creation rights)"

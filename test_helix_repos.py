@@ -60,22 +60,21 @@ class CheckDestinationTests(unittest.TestCase):
     def check(self, api_result, refs="abc\trefs/heads/main\n"):
         responses = [api_result, (0, refs, "")]
         with patch.object(hr, "run", side_effect=lambda *a, **k: responses.pop(0)):
-            return hr.check_destination("github.com", "GSA", "falcon-app", "helix", "A", "app")
+            return hr.check_destination("github.com", "GSA", "falcon-app")
 
     def test_missing_is_new(self):
         self.assertEqual(self.check((1, "", "gh: Not Found (HTTP 404)")), ("new", None))
 
     def test_private_mirror(self):
-        row = "GSA/falcon-app\tprivate\tfalse\tMirror of helix/A/app\n"
+        row = "GSA/falcon-app\tprivate\tfalse\n"
         self.assertEqual(self.check((0, row, "")), ("mirrored", None))
         self.assertEqual(self.check((0, row, ""), refs=""), ("empty", None))
 
     def test_unsafe_destinations(self):
         for row, word in (
-            ("GSA/falcon-app\tinternal\tfalse\tMirror of helix/A/app\n", "NOT private"),
-            ("GSA/falcon-app\tprivate\ttrue\tMirror of helix/A/app\n", "Pages"),
-            ("GSA/other\tprivate\tfalse\tMirror of helix/A/app\n", "redirects"),
-            ("GSA/falcon-app\tprivate\tfalse\tMirror of helix/Z/app\n", "not a mirror"),
+            ("GSA/falcon-app\tinternal\tfalse\n", "NOT private"),
+            ("GSA/falcon-app\tprivate\ttrue\n", "Pages"),
+            ("GSA/other\tprivate\tfalse\n", "redirects"),
         ):
             state, problem = self.check((0, row, ""))
             self.assertIsNone(state)
@@ -92,8 +91,8 @@ if a[:2] == ["auth", "status"]: sys.exit(0)
 if a[:2] == ["repo", "view"]: sys.exit(0 if os.path.isdir(bare(a[2].split("/")[1])) else 1)
 if a[:2] == ["repo", "create"]:
     path = bare(a[2].split("/")[1])
+    if "--description" in a: sys.exit("fake gh: descriptions must stay blank")
     subprocess.run(["git", "init", "-q", "--bare", path], check=True)
-    open(os.path.join(path, "fake-desc"), "w").write(a[a.index("--description") + 1])
     sys.exit(0)
 if a[:2] == ["repo", "edit"]: sys.exit(0)
 if a[0] != "api": sys.exit("fake gh: unsupported " + " ".join(a))
@@ -109,10 +108,9 @@ if path.startswith("repos/"):
     if not os.path.isdir(bare(name)): sys.exit("gh: Not Found (HTTP 404)")
     vis_file = os.path.join(bare(name), "fake-visibility")
     vis = open(vis_file).read().strip() if os.path.exists(vis_file) else "private"
-    desc = open(os.path.join(bare(name), "fake-desc")).read()
     jq = a[a.index("--jq") + 1]
     if "join" in jq: print(f"GSA/{name} {vis} {str(vis == 'private').lower()} false")
-    else: print(f"GSA/{name}\t{vis}\tfalse\t{desc}")
+    else: print(f"GSA/{name}\t{vis}\tfalse")
     sys.exit(0)
 sys.exit("fake gh: unsupported api " + path)
 '''

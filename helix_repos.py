@@ -4,8 +4,7 @@
 Commands
     discover  list every repository your Helix account can see and append the
               new ones to the repos file with a stable destination name
-    plan      check each destination on github.com is private and really a
-              mirror of its source; split specs into "needs a first mirror"
+    plan      check each destination on github.com is private; split specs into "needs a first mirror"
               and "mirrored"; exits 1 if any destination is unsafe
 
 Repos file format (one per line, written by `discover`):
@@ -130,12 +129,12 @@ def append_specs(path, planned, dest_org):
             handle.write(f"{org}/{repo}={dest}\n")
 
 
-def check_destination(dest_host, dest_org, dest, source_host, org, repo):
+def check_destination(dest_host, dest_org, dest):
     """Return ("new"|"empty"|"mirrored", None) or (None, problem)."""
     code, out, err = run(
         [
             "gh", "api", f"repos/{dest_org}/{dest}",
-            "--jq", "[.full_name, .visibility, (.has_pages|tostring), (.description // \"\")] | @tsv",
+            "--jq", "[.full_name, .visibility, (.has_pages|tostring)] | @tsv",
         ],
         env_host=dest_host,
     )
@@ -143,19 +142,13 @@ def check_destination(dest_host, dest_org, dest, source_host, org, repo):
         if "Not Found" in err or "404" in err:
             return "new", None
         return None, f"cannot read {dest_org}/{dest}: {err}"
-    full_name, visibility, pages, description = (out.rstrip("\n").split("\t") + [""] * 4)[:4]
+    full_name, visibility, pages = (out.rstrip("\n").split("\t") + [""] * 3)[:3]
     if full_name.lower() != f"{dest_org}/{dest}".lower():
         return None, f"{dest_org}/{dest} redirects to {full_name}"
     if visibility != "private":
         return None, f"{dest_org}/{dest} is {visibility}, NOT private; fix it now"
     if pages != "false":
         return None, f"{dest_org}/{dest} has GitHub Pages enabled"
-    expected = f"Mirror of {source_host}/{org}/{repo}"
-    if description and description.lower() != expected.lower():
-        return None, (
-            f"{dest_org}/{dest} exists but is not a mirror of {org}/{repo} "
-            f"(description: {description!r}); rename the destination in the repos file"
-        )
     code, refs, err = run(
         ["git", "ls-remote", "--heads", "--tags", f"https://{dest_host}/{dest_org}/{dest}.git"]
     )
@@ -188,9 +181,7 @@ def cmd_plan(args):
         return 2
     problems, pending, mirrored = [], [], []
     for org, repo, dest, _ in entries:
-        state, problem = check_destination(
-            args.dest_host, args.dest_org, dest, args.source_host, org, repo
-        )
+        state, problem = check_destination(args.dest_host, args.dest_org, dest)
         if problem:
             problems.append(problem)
             log(f"  UNSAFE  {org}/{repo} -> {dest}: {problem}")
