@@ -16,8 +16,7 @@ Run it on your **AWS WorkSpace**. That machine can reach both Helix and github.c
 
 ## Setup (once)
 
-1. Copy this `helix-mirror` folder to your WorkSpace.
-2. Log in to both hosts. Each command opens a browser.
+1. Log in to both hosts. Each command opens a browser.
 
    ```bash
    gh auth login --hostname github.helix.gsa.gov --git-protocol https --web
@@ -25,6 +24,15 @@ Run it on your **AWS WorkSpace**. That machine can reach both Helix and github.c
    gh auth login --hostname github.com --git-protocol https --web
    gh auth setup-git --hostname github.com
    ```
+
+2. Get the kit. You need read access to this private repository; ask
+   biggestbinary to add you.
+
+   ```bash
+   GH_HOST=github.com gh repo clone biggestbinary/helix-mirror
+   ```
+
+   Later, run `git -C helix-mirror pull` to pick up new versions.
 
 ## Install: make the first mirrors
 
