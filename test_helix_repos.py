@@ -81,92 +81,6 @@ class CheckDestinationTests(unittest.TestCase):
             self.assertIn(word, problem)
 
 
-def fake_run(responses, calls):
-    """Answer run() from (predicate, result) pairs and record every command."""
-    def answer(command, env_host=None):
-        calls.append(command)
-        text = " ".join(command)
-        for needle, result in responses:
-            if needle in text:
-                return result
-        raise AssertionError(f"unexpected command: {text}")
-    return answer
-
-
-class GrantTests(unittest.TestCase):
-    LISTING = "\n".join([
-        "GSA\tfalcon-app\tprivate\ttrue",
-        "GSA\tfalcon-infra\tprivate\ttrue",
-        "GSA\tfalcon-readonly\tprivate\tfalse",
-        "GSA\tfalcon-public\tpublic\ttrue",
-        "GSA\tfalcon-internal\tinternal\ttrue",
-        "GSA\tother-repo\tprivate\ttrue",
-        "someone\tfalcon-app\tprivate\ttrue",
-    ]) + "\n"
-
-    def grant(self, *argv, put=None):
-        calls = []
-        responses = [
-            ("users/newbie", (0, "newbie\tUser\tNew Bie\n", "")),
-            ("api user --jq", (0, "admin1\n", "")),
-            ("user/repos", (0, self.LISTING, "")),
-            ("collaborators/newbie", put or (0, "HTTP/2.0 201 Created\nX: y\n\n{}", "")),
-        ]
-        with patch.object(hr, "run", side_effect=fake_run(responses, calls)):
-            code = hr.main(["grant", "--repos-file", "/nonexistent", "--user", "newbie", "--yes", *argv])
-        puts = [c[c.index("PUT") + 1] for c in calls if "PUT" in c]
-        return code, puts, calls
-
-    def test_grants_every_private_mirror_you_administer(self):
-        code, puts, calls = self.grant()
-        self.assertEqual(code, 0)
-        self.assertEqual(puts, ["repos/GSA/falcon-app/collaborators/newbie",
-                                "repos/GSA/falcon-infra/collaborators/newbie"])
-        self.assertIn("permission=push", calls[-1])
-
-    def test_repo_filter_skips_ones_you_cannot_grant(self):
-        code, puts, _ = self.grant("--repo", "GSA/falcon-infra", "--repo", "falcon-readonly",
-                                   "--permission", "pull")
-        self.assertEqual(code, 0)
-        self.assertEqual(puts, ["repos/GSA/falcon-infra/collaborators/newbie"])
-
-    def test_policy_refusal_fails(self):
-        code, puts, _ = self.grant(put=(1, "", "gh: Must have admin rights (HTTP 403)"))
-        self.assertEqual(code, 1)
-        self.assertEqual(len(puts), 2)
-
-    def test_rejects_bad_or_unknown_username(self):
-        with self.assertRaises(SystemExit):
-            hr.lookup_user("github.com", "bad name")
-        with patch.object(hr, "run", return_value=(1, "", "gh: Not Found (HTTP 404)")):
-            with self.assertRaisesRegex(SystemExit, "no github.com user"):
-                hr.lookup_user("github.com", "ghost-user")
-
-
-class FileAccessRequestTests(unittest.TestCase):
-    def test_never_posts_repo_names_to_a_public_repo(self):
-        calls = []
-        responses = [("repos/kit/repo --jq .visibility", (0, "internal\n", ""))]
-        with patch.object(hr, "run", side_effect=fake_run(responses, calls)):
-            url, reason = hr.file_access_request("github.com", "kit/repo", "me", "body")
-        self.assertIsNone(url)
-        self.assertIn("not private", reason)
-        self.assertEqual(len(calls), 1)
-
-    def test_opens_issue_or_comments_on_the_open_one(self):
-        for existing, endpoint in (("", "repos/kit/repo/issues"), ("7\n", "repos/kit/repo/issues/7/comments")):
-            calls = []
-            responses = [
-                ("--jq .visibility", (0, "private\n", "")),
-                ("state=open", (0, existing, "")),
-                ("--jq .html_url", (0, "https://github.com/kit/repo/issues/7\n", "")),
-            ]
-            with patch.object(hr, "run", side_effect=fake_run(responses, calls)):
-                url, _ = hr.file_access_request("github.com", "kit/repo", "me", "body")
-            self.assertEqual(url, "https://github.com/kit/repo/issues/7")
-            self.assertEqual(calls[-1][2], endpoint)
-
-
 FAKE_GH = r'''#!/usr/bin/env python3
 import os, subprocess, sys
 root = os.environ["FAKE_ROOT"]
@@ -176,8 +90,6 @@ def bare(name): return os.path.join(root, "gsa", "GSA", name + ".git")
 if a[:2] == ["auth", "status"]: sys.exit(0)
 if a[:2] == ["repo", "view"]: sys.exit(0 if os.path.isdir(bare(a[2].split("/")[1])) else 1)
 if a[:2] == ["repo", "create"]:
-    if os.path.exists(os.path.join(root, "hidden", a[2].split("/")[1])):
-        sys.exit("GraphQL: Name already exists on this account (createRepository)")
     path = bare(a[2].split("/")[1])
     if "--description" in a: sys.exit("fake gh: descriptions must stay blank")
     subprocess.run(["git", "init", "-q", "--bare", path], check=True)
@@ -237,7 +149,6 @@ class EndToEndTests(unittest.TestCase):
             GIT_CONFIG_GLOBAL=str(self.root / "gitconfig"),
             GIT_CONFIG_NOSYSTEM="1",
             HELIX_HOST="localhost",
-            HELIX_MIRROR_ACCESS_REPO="",
         )
         self.listing = []
 
@@ -308,35 +219,6 @@ class EndToEndTests(unittest.TestCase):
         result = self.run_kit("update.sh")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("NOT private", result.stdout)
-
-    def test_name_taken_by_a_repo_you_cannot_see(self):
-        self.helix_repo("orgA", "app")
-        taken = self.root / "helix" / "orgA" / "taken.git"
-        self.helix_repo("orgA", "taken")
-        (self.root / "hidden").mkdir()
-        (self.root / "hidden" / "falcon-taken").touch()
-
-        result = self.run_kit("install.sh", "--yes")
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("ACCESS NEEDED", result.stdout)
-        self.assertIn("./grant-access.sh --user tester --repo falcon-taken", result.stdout)
-        no_access = self.root / "home" / ".config" / "helix-mirror" / "no-access.txt"
-        self.assertIn("orgA/taken=falcon-taken", no_access.read_text())
-        self.assertTrue((self.root / "home" / "falcon" / "falcon-app").is_dir())
-
-        # Still hidden: reported, and not cloned from Helix again.
-        result = self.run_kit("update.sh")
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("1 waiting for access", result.stdout)
-        self.assertNotIn("cloning https://localhost/orgA/taken", result.stdout)
-
-        # A teammate grants access: the mirror becomes visible and is cloned.
-        (self.root / "hidden" / "falcon-taken").unlink()
-        self.git("clone", "-q", "--bare", str(taken), str(self.root / "gsa" / "GSA" / "falcon-taken.git"))
-        result = self.run_kit("update.sh")
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertFalse(no_access.exists())
-        self.assertTrue((self.root / "home" / "falcon" / "falcon-taken").is_dir())
 
 
 if __name__ == "__main__":

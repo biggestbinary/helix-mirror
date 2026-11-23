@@ -5,7 +5,6 @@
 #   HELIX_MIRROR_PREFIX  default falcon-
 #   HELIX_MIRROR_INTO    where working clones live (default ~/falcon)
 #   HELIX_MIRROR_REPOS   repos file (default ~/.config/helix-mirror/repos.txt)
-#   HELIX_MIRROR_ACCESS_REPO  private github.com repo for access-request issues
 
 set -o errexit
 set -o nounset
@@ -18,20 +17,17 @@ export GITHUB_DEST_ORG="${GITHUB_DEST_ORG:-GSA}"
 export HELIX_MIRROR_PREFIX="${HELIX_MIRROR_PREFIX:-falcon-}"
 INTO="${HELIX_MIRROR_INTO:-$HOME/falcon}"
 REPOS_FILE="${HELIX_MIRROR_REPOS:-$HOME/.config/helix-mirror/repos.txt}"
-export HELIX_MIRROR_REPOS="$REPOS_FILE"
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
-# check_prerequisites [HOST ...]   (default: Helix and github.com)
 check_prerequisites() {
     local tool
     for tool in git gh python3; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"
     done
     local host
-    [ "$#" -gt 0 ] || set -- "$HELIX_HOST" "$GITHUB_DEST_HOST"
-    for host in "$@"; do
+    for host in "$HELIX_HOST" "$GITHUB_DEST_HOST"; do
         if ! gh auth status --hostname "$host" >/dev/null 2>&1; then
             die "not logged in to $host. Run:
     gh auth login --hostname $host --git-protocol https --web
@@ -67,12 +63,7 @@ run_mirror() {
         fi
         say "Mirroring new repositories (private, Actions disabled)"
         "$KIT_DIR/mirror-helix-to-github.sh" --dest-org "$GITHUB_DEST_ORG" \
-            --repos-file "$tmp/pending.txt" --conflicts-out "$tmp/conflicts.txt" || status=1
-        if [ -s "$tmp/conflicts.txt" ]; then
-            say "Requesting access to repositories that already exist in github.com/$GITHUB_DEST_ORG"
-            python3 "$KIT_DIR/helix_repos.py" request-access --repos-file "$REPOS_FILE" \
-                --conflicts "$tmp/conflicts.txt" || status=1
-        fi
+            --repos-file "$tmp/pending.txt" || status=1
     fi
 
     say "Re-checking privacy of every mirror"
