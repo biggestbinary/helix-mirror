@@ -25,8 +25,9 @@ Run it on your **AWS WorkSpace**. That machine can reach both Helix and github.c
    gh auth setup-git --hostname github.com
    ```
 
-2. Get the kit. You need read access to this private repository; ask
-   biggestbinary to add you.
+2. Get the kit. This repository is **public**, so anyone can clone it. It
+   holds only scripts. Never put Helix or GSA repository names, logs, or
+   access requests in its issues or pull requests.
 
    ```bash
    GH_HOST=github.com gh repo clone biggestbinary/helix-mirror
@@ -73,15 +74,27 @@ script:
 
 - prints `ACCESS NEEDED`, the repos involved and the exact command a teammate
   must run for you (`./grant-access.sh --user <you> --repo ...`)
-- files that request as an issue in `HELIX_MIRROR_ACCESS_REPO`, but **only if
-  that repository is private** (repository names are internal). Otherwise,
-  send the printed text to a teammate yourself.
 - records the repos in `~/.config/helix-mirror/no-access.txt`. Later runs report
   them as `no access` and don't copy them from Helix again.
 
+**Send the printed `ACCESS NEEDED` text to a teammate** by chat or email. That's
+the normal way to ask. The script won't file the request for you, because the
+default request repository (this kit) is public and repository names are
+internal. It prints `Could not file the request automatically (... is not
+private ...)`. That's expected.
+
+If your team wants requests filed automatically, point
+`HELIX_MIRROR_ACCESS_REPO` at a **private** github.com repository that everyone
+can open issues in. For example, add
+`export HELIX_MIRROR_ACCESS_REPO=GSA/<private-repo>` to your shell profile. The
+script opens one issue per person there, or comments on that person's open
+issue. It checks that the repository is private before every post. It never
+posts anywhere public or `internal`. Set the variable to an empty value to
+turn filing off and stop the message.
+
 Once you have access (accept the invitation if GitHub sends one), run
 `./update.sh`. The repos are cloned and dropped from `no-access.txt`. To print
-or file the request again, run `./request-access.sh`.
+the request again (and file it, if set up), run `./request-access.sh`.
 
 ## Giving someone access (repository admins)
 
@@ -136,7 +149,7 @@ Change these with environment variables. You usually won't need to.
 | `HELIX_MIRROR_REPOS` | `~/.config/helix-mirror/repos.txt` |
 | `HELIX_MIRROR_PREFIX` | `falcon-` |
 | `GITHUB_DEST_ORG` | `GSA` |
-| `HELIX_MIRROR_ACCESS_REPO` | `biggestbinary/helix-mirror` (where access requests are filed; used only while it is private; empty turns filing off) |
+| `HELIX_MIRROR_ACCESS_REPO` | `biggestbinary/helix-mirror`. Access requests are filed here only if the repository is private, and this kit is public, so by default nothing is filed. Set it to a private repo to turn filing on, or leave it empty to turn it off. |
 | `HELIX_HOST` | `github.helix.gsa.gov` |
 
 ## Working on a repository
