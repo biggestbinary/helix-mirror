@@ -64,6 +64,43 @@ Each run:
 
 Both scripts are safe to run again and again. Work that is already done gets skipped.
 
+## When a mirror already exists but you can't see it
+
+A teammate may already have mirrored a repository into a GSA repo that your
+github.com account has no access to. GitHub hides such a repo from you, so the
+script tries to create it and the name is refused. When that happens the
+script:
+
+- prints `ACCESS NEEDED`, the repos involved and the exact command a teammate
+  must run for you (`./grant-access.sh --user <you> --repo ...`)
+- files that request as an issue in `HELIX_MIRROR_ACCESS_REPO`, but **only if
+  that repository is private** (repository names are internal). Otherwise,
+  send the printed text to a teammate yourself.
+- records the repos in `~/.config/helix-mirror/no-access.txt`. Later runs report
+  them as `no access` and don't copy them from Helix again.
+
+Once you have access (accept the invitation if GitHub sends one), run
+`./update.sh`. The repos are cloned and dropped from `no-access.txt`. To print
+or file the request again, run `./request-access.sh`.
+
+## Giving someone access (repository admins)
+
+Only a repository's admins can add people. That's usually whoever mirrored it
+first, or a GSA org owner. To give a teammate's commercial github.com account
+access to every private `GSA/falcon-*` repository you administer, run:
+
+```bash
+./grant-access.sh                       # asks for the username
+./grant-access.sh --user octocat        # or give it directly
+./grant-access.sh --user octocat --repo falcon-app --repo falcon-infra   # only these
+```
+
+The script checks that the account exists, lists the repositories, and asks
+before changing anything. The default permission is `push` (write); change it
+with `--permission pull|triage|push|maintain|admin`. Accounts outside the GSA
+org get an invitation they must accept. Repos you can't administer are
+skipped and reported.
+
 ## Safety rules
 
 - Mirrors are created with a blank description.
@@ -99,6 +136,7 @@ Change these with environment variables. You usually won't need to.
 | `HELIX_MIRROR_REPOS` | `~/.config/helix-mirror/repos.txt` |
 | `HELIX_MIRROR_PREFIX` | `falcon-` |
 | `GITHUB_DEST_ORG` | `GSA` |
+| `HELIX_MIRROR_ACCESS_REPO` | `biggestbinary/helix-mirror` (where access requests are filed; used only while it is private; empty turns filing off) |
 | `HELIX_HOST` | `github.helix.gsa.gov` |
 
 ## Working on a repository
@@ -120,6 +158,8 @@ git switch -c my-change            # open your PR against origin (GSA) as usual
 | `not logged in to <host>` | Run the two `gh auth` commands for that host (Setup, step 2). |
 | `cannot resolve github.helix.gsa.gov` / `network path ... blocked` | You're not on the WorkSpace, or the VPN is down. |
 | `gh repo create failed` | Your github.com account can't create repositories in GSA. Ask an org owner. |
+| `NO ACCESS` / `ACCESS NEEDED` / `no access` | The GSA repo exists, but you aren't allowed to see it. See "When a mirror already exists but you can't see it". |
+| `GSA policy may not allow adding this account` | GSA's org settings block that account. Ask a GSA org owner. |
 | `blob over 100MB` | That repository needs a large-file cleanup before it can be mirrored. Comment it out for now. |
 | `DIVERGED` | The branch changed on both sides. Reconcile it by hand in `~/falcon/<repo>`. |
 
@@ -165,8 +205,10 @@ Done. Repos file: ~/.config/helix-mirror/repos.txt   Clones: ~/falcon
 | File | Purpose |
 | --- | --- |
 | `install.sh`, `update.sh` | The two commands above |
+| `request-access.sh` | Asks again for access to existing mirrors you can't see |
+| `grant-access.sh` | For admins: gives a github.com account access to the mirrors |
 | `common.sh` | Shared steps behind both commands |
-| `helix_repos.py` | Finds Helix repositories, picks names and checks that destinations are safe |
+| `helix_repos.py` | Finds Helix repositories, picks names, checks that destinations are safe, and handles access requests and grants |
 | `mirror-helix-to-github.sh` | Makes the first private mirror of each repository |
 | `sync-helix-gsa.py` | Keeps clones and mirrors in sync, and can push branches or open PRs back to Helix |
 | `verify-mirror.sh` | Read-only check that a mirror's refs exactly match Helix |
