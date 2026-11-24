@@ -565,6 +565,28 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("SOURCE MISMATCH", result.stdout)
         self.assertEqual(self.git("--git-dir", str(gsa), "for-each-ref"), before)
 
+    def test_unreadable_source_refs_stop_the_push(self):
+        # A wrapper git that fails only the source-ref lookup, as a flaky network would.
+        self.helix_repo("orgA", "foo")
+        self.run_kit("install.sh", "--yes")
+        self.helix_repo("orgB", "foo")
+        real = subprocess.run(["which", "git"], env=self.env, stdout=subprocess.PIPE, text=True).stdout.strip()
+        wrapper = self.root / "bin" / "git"
+        wrapper.write_text(
+            f'#!/usr/bin/env bash\ncase "$*" in *"ls-remote"*"refs/helix-mirror/source/*"*) '
+            f'echo "fatal: simulated network failure" >&2; exit 128;; esac\nexec {real} "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        gsa = self.root / "gsa" / "GSA" / "falcon-foo.git"
+        before = self.git("--git-dir", str(gsa), "for-each-ref")
+        result = self.run_kit("mirror-helix-to-github.sh", "--dest-org", "GSA", "--allow-nonempty",
+                              "orgB/foo=falcon-foo")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not read the recorded source", result.stdout)
+        wrapper.unlink()
+        self.assertEqual(self.git("--git-dir", str(gsa), "for-each-ref"), before)
+
 
 if __name__ == "__main__":
     unittest.main()

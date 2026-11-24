@@ -262,9 +262,9 @@ class Repo:
         """Refuse to sync a mirror that was made from a different Helix repository.
 
         Returns a list of problems (empty when fine). Two checks: the source
-        recorded on the GSA repository must match this spec, and, once both
-        sides are fetched, their default branches must share history. Older
-        mirrors with no recorded source pass the first check.
+        recorded on the GSA repository must match this spec; failing that, for
+        an older mirror with no recorded source, the branches of both sides
+        (fetched) must share a root commit.
         """
         code, out = git(
             ["ls-remote", "origin", f"{SOURCE_REF_PREFIX}*"],
@@ -283,21 +283,34 @@ class Repo:
                 f"{', '.join(sorted(recorded))}, not of {self.source_id()}; nothing was synced. "
                 "Give this Helix repository its own destination name in the repos file."
             ]
-        branch = self.default_branch("origin")
-        if branch is None:
+        if recorded:
             return []
-        helix_ref, gsa_ref = f"refs/remotes/helix/{branch}", f"refs/remotes/origin/{branch}"
-        have = [
-            git(["rev-parse", "--verify", "--quiet", ref], cwd=self.path, check=False)[0] == 0
-            for ref in (helix_ref, gsa_ref)
-        ]
-        if all(have) and git(["merge-base", helix_ref, gsa_ref], cwd=self.path, check=False)[0] != 0:
+        # An older mirror records no source, so prove the two sides share
+        # history: some root commit must be common to the branches of both,
+        # whatever their default branches are called. Missing refs are not a pass.
+        helix_roots = self.root_commits("refs/remotes/helix")
+        gsa_roots = self.root_commits("refs/remotes/origin")
+        if not gsa_roots:
+            return []  # nothing on GSA yet; nothing can be mixed
+        if not helix_roots:
             return [
-                f"SOURCE MISMATCH: helix/{branch} and origin/{branch} share no history, so "
-                f"{self.config.dest_org}/{self.dest_name} was not made from {self.src_org}/{self.src_repo}; "
-                "nothing was synced."
+                "no Helix refs locally, so the mirror's source cannot be verified; nothing was "
+                "synced (drop --no-fetch, or check Helix access)"
+            ]
+        if not helix_roots & gsa_roots:
+            return [
+                f"SOURCE MISMATCH: {self.src_org}/{self.src_repo} on Helix and "
+                f"{self.config.dest_org}/{self.dest_name} share no history, so the mirror "
+                "was not made from this repository; nothing was synced. Give this Helix "
+                "repository its own destination name in the repos file."
             ]
         return []
+
+    def root_commits(self, prefix):
+        _, out = git(
+            ["rev-list", "--max-parents=0", f"--glob={prefix}/*"], cwd=self.path, check=False
+        )
+        return set(out.split())
 
     def configure_helix_refspecs(self):
         """Keep Helix refs in their own namespaces.

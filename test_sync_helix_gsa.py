@@ -681,6 +681,42 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("share no history", output)
         self.assertEqual(self.gsa_tip(), before)
 
+    def test_unrelated_history_is_refused_even_when_default_branch_names_differ(self):
+        other = self.root / "other-main"
+        run(["git", "init", "-q", str(other)])
+        run(["git", "config", "user.email", "t@example.invalid"], cwd=other)
+        run(["git", "config", "user.name", "Test"], cwd=other)
+        (other / "g").write_text("unrelated\n", encoding="utf-8")
+        run(["git", "add", "."], cwd=other)
+        run(["git", "commit", "-qm", "unrelated root"], cwd=other)
+        run(["git", "branch", "-M", "main"], cwd=other)
+        # Helix's only branch is now main; the GSA mirror's default is master.
+        run(["git", f"--git-dir={self.helix}", "branch", "-D", "master"])
+        run(["git", "push", "-q", str(self.helix), "main"], cwd=other)
+        run(["git", f"--git-dir={self.helix}", "symbolic-ref", "HEAD", "refs/heads/main"])
+        before = run(["git", f"--git-dir={self.gsa}", "for-each-ref"])
+        code, output = self.invoke("pull")
+        self.assertEqual(code, 1, output)
+        self.assertIn("share no history", output)
+        self.assertEqual(run(["git", f"--git-dir={self.gsa}", "for-each-ref"]), before)
+
+    def test_clone_without_origin_head_is_still_checked(self):
+        self.invoke("status")
+        clone = self.into / "app"
+        run(["git", "remote", "set-head", "origin", "-d"], cwd=clone)
+        run(["git", f"--git-dir={self.helix}", "update-ref", "-d", "refs/heads/master"])
+        other = self.root / "other-nohead"
+        run(["git", "init", "-q", str(other)])
+        run(["git", "config", "user.email", "t@example.invalid"], cwd=other)
+        run(["git", "config", "user.name", "Test"], cwd=other)
+        (other / "g").write_text("unrelated\n", encoding="utf-8")
+        run(["git", "add", "."], cwd=other)
+        run(["git", "commit", "-qm", "unrelated root"], cwd=other)
+        run(["git", "push", "-q", str(self.helix), "HEAD:refs/heads/main"], cwd=other)
+        code, output = self.invoke("pull")
+        self.assertEqual(code, 1, output)
+        self.assertIn("share no history", output)
+
     def test_push_to_helix_is_refused_for_a_mismatched_mirror(self):
         self.invoke("status")
         self.record_gsa_source("helix.invalid/other-org/app")

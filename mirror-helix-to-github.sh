@@ -345,10 +345,13 @@ record_source() {
 }
 
 destination_source_conflict() {
-    # Prints the recorded source(s) and fails when the destination already
-    # records a source other than $1. Unrecorded (older) mirrors pass.
+    # $1 = expected source id, $2 = destination URL. Prints the recorded
+    # source(s) (or the git error) on stdout. Returns 0 when the destination
+    # records $1 or records nothing (an older mirror), 1 when it records
+    # another source, 2 when the source refs cannot be read: callers must
+    # then refuse to push.
     local sid="$1" refs recorded
-    refs="$(git ls-remote "$2" "${SOURCE_REF_PREFIX}*" 2>>"$repo_log")" || return 0
+    refs="$(git ls-remote "$2" "${SOURCE_REF_PREFIX}*" 2>&1)" || { printf '%s' "$refs" | tail -3; return 2; }
     recorded="$(printf '%s\n' "$refs" | awk -v p="$SOURCE_REF_PREFIX" 'index($2, p) == 1 {print substr($2, length(p) + 1)}')"
     [ -n "$recorded" ] || return 0
     if ! printf '%s\n' "$recorded" | grep -qx -- "$sid"; then
@@ -515,8 +518,14 @@ for spec in "${REPO_ARGS[@]}"; do
             cd "$WORKDIR"
             continue
         fi
-        if ! other_source="$(destination_source_conflict "$(source_id "$src_org" "$src_repo")" "$dest_url")"; then
+        source_status=0
+        other_source="$(destination_source_conflict "$(source_id "$src_org" "$src_repo")" "$dest_url")" || source_status=$?
+        if [ "$source_status" -eq 1 ]; then
             repo_failed "SOURCE MISMATCH: $dest_full is the mirror of ${other_source% }, not of $(source_id "$src_org" "$src_repo"); use a different destination name"
+            cd "$WORKDIR"
+            continue
+        elif [ "$source_status" -ne 0 ]; then
+            repo_failed "could not read the recorded source of $dest_full ($other_source); refusing to push"
             cd "$WORKDIR"
             continue
         fi
