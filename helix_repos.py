@@ -13,8 +13,11 @@ Commands
               --conflicts, written by mirror-helix-to-github.sh) and ask for access: open or
               update an issue in $HELIX_MIRROR_ACCESS_REPO when that repository is private,
               and always print what to send a teammate
-    grant     (repository admins) give one github.com user access to every private
-              <dest-org>/<prefix>* repository you administer, or just the --repo ones
+    grant     (repository admins) give one github.com user read access (or --permission)
+              to the --repo mirrors you name, or to --all the mirrors in your repos file
+              that you administer. The user must be a member of the destination org
+              unless --allow-outside-collaborator is given; existing access is never
+              lowered.
 
 Repos file format (one per line, written by `discover`):
     source-org/repo=falcon-repo     mirrored
@@ -23,6 +26,10 @@ Repos file format (one per line, written by `discover`):
 Destination names are "<prefix><repo>". When the same repository name exists
 under more than one Helix owner, every new one gets "<prefix><owner>-<repo>".
 Names already in the file never change.
+
+Every mirror records the Helix repository it was made from in the ref
+refs/helix-mirror/source/<host>/<owner>/<repo>. `plan` refuses (SOURCE MISMATCH)
+to treat a destination as the mirror of a different Helix repository.
 """
 
 import argparse
@@ -36,6 +43,10 @@ from pathlib import Path
 NAME = r"[A-Za-z0-9._-]+"
 LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 PERMISSIONS = ("pull", "triage", "push", "maintain", "admin")
+# GitHub reports a collaborator's exact level as role_name (read < triage < write < maintain < admin).
+ROLE_RANK = {"none": -1, "read": 0, "triage": 1, "write": 2, "maintain": 3, "admin": 4}
+PERMISSION_RANK = {"pull": 0, "triage": 1, "push": 2, "maintain": 3, "admin": 4}
+SOURCE_REF_PREFIX = "refs/helix-mirror/source/"
 DEFAULT_ACCESS_REPO = "biggestbinary/helix-mirror"
 SPEC_RE = re.compile(rf"^\s*(#\s*)?({NAME})/({NAME})={NAME}\s*$")
 FILE_HEADER = """\
@@ -51,6 +62,8 @@ def log(message):
 
 def run(command, env_host=None):
     env = dict(os.environ)
+    # Never block on a credential prompt (e.g. git ls-remote of a repo you cannot see).
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if env_host:
         env["GH_HOST"] = env_host
     completed = subprocess.run(
@@ -72,6 +85,38 @@ def read_specs(path):
         dest = spec.split("=", 1)[1]
         entries.append((match.group(2), match.group(3), dest, bool(match.group(1))))
     return entries
+
+
+def source_id(host, org, repo):
+    """Identity of a Helix repository, as recorded on its mirror (case-insensitive)."""
+    return f"{host}/{org}/{repo}".lower()
+
+
+def source_ref(host, org, repo):
+    return SOURCE_REF_PREFIX + source_id(host, org, repo)
+
+
+def qualified_name(prefix, org, repo):
+    return f"{prefix}{org}-{repo}"
+
+
+def parse_recorded_sources(ls_remote_output):
+    """Source ids recorded on a mirror, from `git ls-remote` output."""
+    found = set()
+    for line in ls_remote_output.splitlines():
+        _, _, ref = line.partition("\t")
+        if ref.startswith(SOURCE_REF_PREFIX):
+            found.add(ref[len(SOURCE_REF_PREFIX):])
+    return found
+
+
+def mismatch_message(dest_org, dest, recorded, source, prefix):
+    org, repo = source[1], source[2]
+    return (
+        f"SOURCE MISMATCH: {dest_org}/{dest} is the mirror of {', '.join(sorted(recorded))}, "
+        f"not of {source_id(*source)}; nothing will be synced into it. Change this repository's "
+        f"destination in the repos file to an unused name such as {qualified_name(prefix, org, repo)}"
+    )
 
 
 def assign_names(existing, discovered, prefix):
@@ -141,8 +186,12 @@ def append_specs(path, planned, dest_org):
             handle.write(f"{org}/{repo}={dest}\n")
 
 
-def check_destination(dest_host, dest_org, dest):
-    """Return ("new"|"empty"|"mirrored", None) or (None, problem)."""
+def check_destination(dest_host, dest_org, dest, source=None, prefix=""):
+    """Return ("new"|"empty"|"mirrored", None) or (None, problem).
+
+    source is (host, org, repo) of the Helix repository this destination is meant
+    to mirror. A destination that records a different source is refused.
+    """
     code, out, err = run(
         [
             "gh", "api", f"repos/{dest_org}/{dest}",
@@ -162,11 +211,26 @@ def check_destination(dest_host, dest_org, dest):
     if pages != "false":
         return None, f"{dest_org}/{dest} has GitHub Pages enabled"
     code, refs, err = run(
-        ["git", "ls-remote", "--heads", "--tags", f"https://{dest_host}/{dest_org}/{dest}.git"]
+        ["git", "ls-remote", f"https://{dest_host}/{dest_org}/{dest}.git",
+         "refs/heads/*", "refs/tags/*", SOURCE_REF_PREFIX + "*"]
     )
     if code != 0:
         return None, f"cannot list refs of {dest_org}/{dest}: {err}"
-    return ("mirrored" if refs.strip() else "empty"), None
+    recorded = parse_recorded_sources(refs)
+    if source and recorded and source_id(*source) not in recorded:
+        return None, mismatch_message(dest_org, dest, recorded, source, prefix)
+    has_content = any(
+        line.partition("\t")[2].startswith(("refs/heads/", "refs/tags/")) for line in refs.splitlines()
+    )
+    return ("mirrored" if has_content else "empty"), None
+
+
+def recorded_sources(dest_host, dest_org, dest):
+    """Return the source ids recorded on a destination, or None when it cannot be read."""
+    code, out, _ = run(
+        ["git", "ls-remote", f"https://{dest_host}/{dest_org}/{dest}.git", SOURCE_REF_PREFIX + "*"]
+    )
+    return parse_recorded_sources(out) if code == 0 else None
 
 
 def no_access_path(args):
@@ -200,14 +264,18 @@ def gh_login(dest_host):
     return out.strip()
 
 
-def access_message(login, dest_org, specs):
+def access_message(login, dest_org, specs, known=None):
+    known = known or {}
     lines = [
         f"ACCESS NEEDED: these {dest_org} repositories already exist, but your github.com",
         f"account ({login}) has no access to them, so you cannot mirror or clone them:",
     ]
     for spec in specs:
         source, dest = spec.split("=", 1)
-        lines.append(f"  {dest_org}/{dest}   (Helix {source})")
+        line = f"  {dest_org}/{dest}   (Helix {source})"
+        if dest.lower() in known:
+            line += f"   mirror source: {', '.join(sorted(known[dest.lower()]))}"
+        lines.append(line)
     repo_args = " ".join(f"--repo {spec.split('=', 1)[1]}" for spec in specs)
     lines += [
         "Ask a teammate with admin rights on them (usually whoever mirrored them first)",
@@ -248,6 +316,34 @@ def file_access_request(dest_host, access_repo, login, body):
     return out.strip(), None
 
 
+def split_known_sources(args, specs, recorded, no_access_file):
+    """Look up the recorded source of destinations that are readable after all.
+
+    Returns ({dest.lower(): sources}, specs still worth requesting). A destination
+    that is the mirror of a different Helix repository is not requested: the
+    caller is told to use an owner-qualified name instead, and it is dropped
+    from the no-access file.
+    """
+    known, keep, dropped = {}, [], []
+    for spec in specs:
+        source, dest = spec.split("=", 1)
+        org, repo = source.split("/", 1)
+        sources = recorded_sources(args.dest_host, args.dest_org, dest)
+        if sources:
+            known[dest.lower()] = sources
+            wanted = (args.source_host, org, repo)
+            if source_id(*wanted) not in sources:
+                log(mismatch_message(args.dest_org, dest, sources, wanted, args.prefix))
+                dropped.append(dest.lower())
+                continue
+        keep.append(spec)
+    if dropped:
+        write_no_access(no_access_file, [s for d, s in recorded.items() if d not in dropped])
+    if not keep:
+        log("Nothing to request: no access is needed once the names above are changed.")
+    return known, keep
+
+
 def cmd_request_access(args):
     path = no_access_path(args)
     recorded = read_no_access(path)
@@ -261,8 +357,11 @@ def cmd_request_access(args):
     if not specs:
         log("Nothing to request: no repositories are waiting for access.")
         return 0
+    known, specs = split_known_sources(args, specs, recorded, path)
+    if not specs:
+        return 0
     login = gh_login(args.dest_host)
-    message = access_message(login, args.dest_org, specs)
+    message = access_message(login, args.dest_org, specs, known)
     log(message)
     if args.access_repo:
         url, reason = file_access_request(args.dest_host, args.access_repo, login, message)
@@ -315,8 +414,32 @@ def lookup_user(dest_host, login):
     return found, f"{found} ({name})" if name else found
 
 
+def existing_access(dest_host, dest_org, repo, login):
+    """Return (role_name, None) for login on the repo, or (None, problem)."""
+    code, out, err = run(
+        ["gh", "api", f"repos/{dest_org}/{repo}/collaborators/{login}/permission",
+         "--jq", "[.permission, (.role_name // .permission)] | @tsv"],
+        env_host=dest_host,
+    )
+    if code != 0:
+        problem = err.splitlines()[-1] if err else "request failed"
+        return None, f"cannot read existing access ({problem}); nothing changed"
+    _, _, role = out.rstrip("\n").partition("\t")
+    return role.lower(), None
+
+
 def add_collaborator(dest_host, dest_org, repo, login, permission):
-    """Return ("granted"|"invited", None) or (None, problem)."""
+    """Return ("granted"|"invited"|"already", None) or (None, problem).
+
+    Never lowers access: the PUT below would also change an existing
+    collaborator's permission, so the current level is read first and anyone
+    who already has the requested level or more (or a custom role) is left alone.
+    """
+    role, problem = existing_access(dest_host, dest_org, repo, login)
+    if problem:
+        return None, problem
+    if role not in ROLE_RANK or ROLE_RANK[role] >= PERMISSION_RANK[permission]:
+        return "already", None
     code, out, err = run(
         ["gh", "api", "-i", "-X", "PUT", f"repos/{dest_org}/{repo}/collaborators/{login}",
          "-f", f"permission={permission}"],
@@ -331,15 +454,36 @@ def add_collaborator(dest_host, dest_org, repo, login, permission):
     return ("invited" if status == "201" else "granted"), None
 
 
+def require_org_member(dest_host, dest_org, login):
+    """Exit unless login is a member of dest_org."""
+    code, _, err = run(["gh", "api", f"orgs/{dest_org}/members/{login}"], env_host=dest_host)
+    if code == 0:
+        return
+    if "Not Found" in err or "404" in err:
+        raise SystemExit(
+            f"ERROR: {login} is not a member of {dest_org}, so private {dest_org} code would be shared "
+            "with an outside account. Ask an org owner to add them to the org, or, if an outside "
+            "collaborator is really intended, add --allow-outside-collaborator."
+        )
+    raise SystemExit(f"ERROR: cannot verify that {login} is a member of {dest_org}: {err}")
+
+
 def cmd_grant(args):
     login = args.user
     if not login:
         if not sys.stdin.isatty():
             raise SystemExit("ERROR: give the account with --user LOGIN")
         login = input("Commercial github.com username to grant access to: ").strip().lstrip("@")
+    if not args.repo and not args.all:
+        raise SystemExit("ERROR: say what to grant: --repo NAME (repeatable), or --all for every "
+                         "mirror in your repos file that you administer")
+    if args.all and args.yes:
+        raise SystemExit("ERROR: --yes needs an explicit --repo list; --all always asks first")
     login, display = lookup_user(args.dest_host, login)
     if login.lower() == gh_login(args.dest_host).lower():
         raise SystemExit("ERROR: that is your own account")
+    if not args.allow_outside_collaborator:
+        require_org_member(args.dest_host, args.dest_org, login)
 
     admin = list_admin_mirrors(args.dest_host, args.dest_org, args.prefix)
     if args.repo:
@@ -352,9 +496,11 @@ def cmd_grant(args):
             else:
                 log(f"  skip    {args.dest_org}/{wanted}: not a private {args.prefix}* repository you administer")
     else:
-        repos = admin
+        ours = {dest.lower() for _, _, dest, excluded in read_specs(Path(args.repos_file).expanduser())
+                if not excluded}
+        repos = [name for name in admin if name.lower() in ours]
     if not repos:
-        log(f"Nothing to grant: you are not an admin of any matching private {args.dest_org} repository.")
+        log(f"Nothing to grant: you do not administer any matching private {args.dest_org} mirror.")
         log("Only a repository's admins (usually whoever mirrored it) or a GSA org owner can grant access.")
         return 1
 
@@ -364,12 +510,12 @@ def cmd_grant(args):
     if not args.yes:
         if not sys.stdin.isatty():
             raise SystemExit("ERROR: add --yes to grant without a prompt")
-        answer = input(f"Grant {args.permission} access on these {len(repos)} private repositories to {display}? [y/N] ")
+        answer = input(f"Grant at least {args.permission} access on these {len(repos)} private repositories to {display}? [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             log("Stopped. Nothing was changed.")
             return 1
 
-    failed = invited = 0
+    failed = invited = already = 0
     for name in repos:
         result, problem = add_collaborator(args.dest_host, args.dest_org, name, login, args.permission)
         if problem:
@@ -377,10 +523,12 @@ def cmd_grant(args):
             log(f"  FAIL    {args.dest_org}/{name}: {problem}")
         else:
             invited += result == "invited"
+            already += result == "already"
             log(f"  {result:<7} {args.dest_org}/{name}")
     if invited:
         log(f"{login} must accept {invited} invitation(s) at https://github.com/notifications or by email.")
-    log(f"{len(repos) - failed} granted or invited, {failed} failed")
+    log(f"{len(repos) - failed - already} granted or invited, {already} already had this access or more, "
+        f"{failed} failed")
     return 1 if failed else 0
 
 
@@ -410,7 +558,8 @@ def cmd_plan(args):
     no_access = read_no_access(no_access_file)
     problems, pending, mirrored, waiting, visible_now = [], [], [], [], []
     for org, repo, dest, _ in entries:
-        state, problem = check_destination(args.dest_host, args.dest_org, dest)
+        state, problem = check_destination(
+            args.dest_host, args.dest_org, dest, source=(args.source_host, org, repo), prefix=args.prefix)
         if problem:
             problems.append(problem)
             log(f"  UNSAFE  {org}/{repo} -> {dest}: {problem}")
@@ -460,9 +609,14 @@ def main(argv=None):
     parser.add_argument("--access-repo", default=os.environ.get("HELIX_MIRROR_ACCESS_REPO", DEFAULT_ACCESS_REPO),
                         help="private github.com repo for access-request issues (empty: never file)")
     parser.add_argument("--user", help="grant: github.com username to add")
-    parser.add_argument("--repo", action="append", help="grant: only this repository (repeatable)")
-    parser.add_argument("--permission", choices=PERMISSIONS, default="push", help="grant: default push (write)")
-    parser.add_argument("--yes", action="store_true", help="grant: do not ask for confirmation")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--repo", action="append", help="grant: this repository (repeatable)")
+    scope.add_argument("--all", action="store_true",
+                       help="grant: every mirror in your repos file that you administer (always asks)")
+    parser.add_argument("--permission", choices=PERMISSIONS, default="pull", help="grant: default pull (read)")
+    parser.add_argument("--allow-outside-collaborator", action="store_true",
+                        help="grant: allow an account that is not a member of the destination org")
+    parser.add_argument("--yes", action="store_true", help="grant: do not ask for confirmation (needs --repo)")
     args = parser.parse_args(argv)
     commands = {"discover": cmd_discover, "plan": cmd_plan,
                 "request-access": cmd_request_access, "grant": cmd_grant}

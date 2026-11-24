@@ -6,10 +6,13 @@ insteadOf rewrites and puts a small fake `gh` on PATH, so real git and the
 real scripts run without any network.
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -97,41 +100,152 @@ class GrantTests(unittest.TestCase):
     LISTING = "\n".join([
         "GSA\tfalcon-app\tprivate\ttrue",
         "GSA\tfalcon-infra\tprivate\ttrue",
+        "GSA\tfalcon-stray\tprivate\ttrue",
         "GSA\tfalcon-readonly\tprivate\tfalse",
         "GSA\tfalcon-public\tpublic\ttrue",
         "GSA\tfalcon-internal\tinternal\ttrue",
         "GSA\tother-repo\tprivate\ttrue",
         "someone\tfalcon-app\tprivate\ttrue",
     ]) + "\n"
+    REPOS_FILE = (
+        "A/app=falcon-app\n"
+        "A/infra=falcon-infra\n"
+        "A/readonly=falcon-readonly\n"
+        "# A/excluded=falcon-stray\n"
+    )
 
-    def grant(self, *argv, put=None):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repos_file = Path(self.tmp.name) / "repos.txt"
+        self.repos_file.write_text(self.REPOS_FILE, encoding="utf-8")
+
+    def grant(self, *argv, put=None, member=(0, "", ""), perms=None, yes=True):
+        """Run `grant`. perms maps repo -> "permission\trole_name" for existing access."""
+        perms = perms or {}
         calls = []
-        responses = [
-            ("users/newbie", (0, "newbie\tUser\tNew Bie\n", "")),
-            ("api user --jq", (0, "admin1\n", "")),
-            ("user/repos", (0, self.LISTING, "")),
-            ("collaborators/newbie", put or (0, "HTTP/2.0 201 Created\nX: y\n\n{}", "")),
-        ]
-        with patch.object(hr, "run", side_effect=fake_run(responses, calls)):
-            code = hr.main(["grant", "--repos-file", "/nonexistent", "--user", "newbie", "--yes", *argv])
+
+        def answer(command, env_host=None):
+            calls.append(command)
+            text = " ".join(command)
+            if "orgs/GSA/members/newbie" in text:
+                return member
+            if "/permission" in text:
+                repo = text.split("repos/GSA/")[1].split("/")[0]
+                return (0, perms.get(repo, "none\tnone") + "\n", "")
+            if "users/newbie" in text:
+                return (0, "newbie\tUser\tNew Bie\n", "")
+            if "api user --jq" in text:
+                return (0, "admin1\n", "")
+            if "user/repos" in text:
+                return (0, self.LISTING, "")
+            if "collaborators/newbie" in text:
+                return put or (0, "HTTP/2.0 201 Created\nX: y\n\n{}", "")
+            raise AssertionError(f"unexpected command: {text}")
+
+        extra = ["--yes"] if yes else []
+        with patch.object(hr, "run", side_effect=answer):
+            code = hr.main(["grant", "--repos-file", str(self.repos_file), "--user", "newbie", *extra, *argv])
         puts = [c[c.index("PUT") + 1] for c in calls if "PUT" in c]
         return code, puts, calls
 
-    def test_grants_every_private_mirror_you_administer(self):
-        code, puts, calls = self.grant()
+    # -- scope (HM-2) --
+
+    def test_requires_repo_or_all(self):
+        with self.assertRaisesRegex(SystemExit, "--repo"):
+            self.grant(yes=False)
+
+    def test_default_permission_is_pull(self):
+        _, puts, calls = self.grant("--repo", "falcon-app")
+        self.assertEqual(puts, ["repos/GSA/falcon-app/collaborators/newbie"])
+        self.assertIn("permission=pull", calls[-1])
+
+    def test_all_without_a_terminal_changes_nothing(self):
+        # Not a tty here, so the confirmation is refused before any change is made.
+        with self.assertRaisesRegex(SystemExit, "--yes"):
+            self.grant("--all", yes=False)
+
+    def test_all_confirmed_grants_only_repos_file_mirrors_you_administer(self):
+        with patch("builtins.input", return_value="y"), patch.object(sys.stdin, "isatty", return_value=True):
+            code, puts, _ = self.grant("--all", yes=False)
         self.assertEqual(code, 0)
+        # falcon-stray is admin-visible but excluded from the repos file; falcon-readonly is not admin.
         self.assertEqual(puts, ["repos/GSA/falcon-app/collaborators/newbie",
                                 "repos/GSA/falcon-infra/collaborators/newbie"])
-        self.assertIn("permission=push", calls[-1])
+
+    def test_yes_is_refused_without_an_explicit_repo_list(self):
+        with self.assertRaisesRegex(SystemExit, "--yes"):
+            self.grant("--all", yes=True)
+
+    def test_repo_and_all_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            self.grant("--all", "--repo", "falcon-app")
 
     def test_repo_filter_skips_ones_you_cannot_grant(self):
         code, puts, _ = self.grant("--repo", "GSA/falcon-infra", "--repo", "falcon-readonly",
-                                   "--permission", "pull")
+                                   "--repo", "falcon-public")
         self.assertEqual(code, 0)
         self.assertEqual(puts, ["repos/GSA/falcon-infra/collaborators/newbie"])
 
+    def test_non_member_is_refused_before_anything_changes(self):
+        with self.assertRaisesRegex(SystemExit, "not a member"):
+            self.grant("--repo", "falcon-app", member=(1, "", "gh: Not Found (HTTP 404)"))
+
+    def test_unverifiable_membership_is_refused(self):
+        with self.assertRaisesRegex(SystemExit, "cannot verify"):
+            self.grant("--repo", "falcon-app", member=(1, "", "gh: Server Error (HTTP 500)"))
+
+    def test_outside_collaborator_needs_explicit_flag(self):
+        code, puts, calls = self.grant("--repo", "falcon-app", "--allow-outside-collaborator",
+                                       member=(1, "", "gh: Not Found (HTTP 404)"))
+        self.assertEqual(code, 0)
+        self.assertEqual(puts, ["repos/GSA/falcon-app/collaborators/newbie"])
+        self.assertFalse(any("orgs/GSA/members" in " ".join(c) for c in calls))
+
+    # -- downgrade (HM-3) --
+
+    def test_never_downgrades_an_existing_collaborator(self):
+        perms = {"falcon-app": "admin\tadmin", "falcon-infra": "write\twrite"}
+        code, puts, _ = self.grant("--repo", "falcon-app", "--repo", "falcon-infra",
+                                   "--permission", "triage", perms=perms)
+        self.assertEqual(code, 0)
+        self.assertEqual(puts, [])
+
+    def test_equal_access_is_kept_and_lower_access_is_raised(self):
+        perms = {"falcon-app": "write\twrite", "falcon-infra": "read\tread"}
+        code, puts, _ = self.grant("--repo", "falcon-app", "--repo", "falcon-infra",
+                                   "--permission", "push", perms=perms)
+        self.assertEqual(puts, ["repos/GSA/falcon-infra/collaborators/newbie"])
+
+    def test_maintain_role_is_not_lowered_to_push(self):
+        # The legacy `permission` field reports maintain as write; role_name is exact.
+        _, puts, _ = self.grant("--repo", "falcon-app", "--permission", "push",
+                                perms={"falcon-app": "write\tmaintain"})
+        self.assertEqual(puts, [])
+
+    def test_custom_role_is_left_alone(self):
+        _, puts, _ = self.grant("--repo", "falcon-app", "--permission", "admin",
+                                perms={"falcon-app": "write\tdeployer"})
+        self.assertEqual(puts, [])
+
+    def test_failed_access_lookup_changes_nothing(self):
+        calls = []
+
+        def answer(command, env_host=None):
+            calls.append(command)
+            if "/permission" in " ".join(command):
+                return (1, "", "gh: Server Error (HTTP 500)")
+            raise AssertionError("must not continue")
+
+        with patch.object(hr, "run", side_effect=answer):
+            result, problem = hr.add_collaborator("github.com", "GSA", "falcon-app", "newbie", "pull")
+        self.assertIsNone(result)
+        self.assertIn("HTTP 500", problem)
+        self.assertFalse(any("PUT" in c for c in calls))
+
     def test_policy_refusal_fails(self):
-        code, puts, _ = self.grant(put=(1, "", "gh: Must have admin rights (HTTP 403)"))
+        code, puts, _ = self.grant("--repo", "falcon-app", "--repo", "falcon-infra",
+                                   put=(1, "", "gh: Must have admin rights (HTTP 403)"))
         self.assertEqual(code, 1)
         self.assertEqual(len(puts), 2)
 
@@ -141,6 +255,86 @@ class GrantTests(unittest.TestCase):
         with patch.object(hr, "run", return_value=(1, "", "gh: Not Found (HTTP 404)")):
             with self.assertRaisesRegex(SystemExit, "no github.com user"):
                 hr.lookup_user("github.com", "ghost-user")
+
+
+class SourceIdentityTests(unittest.TestCase):
+    def test_ref_is_lowercase_and_namespaced(self):
+        self.assertEqual(hr.source_id("Helix.Example", "OrgA", "Foo"), "helix.example/orga/foo")
+        self.assertEqual(hr.source_ref("Helix.Example", "OrgA", "Foo"),
+                         "refs/helix-mirror/source/helix.example/orga/foo")
+
+    def test_recorded_sources_ignore_other_refs(self):
+        out = ("a\trefs/heads/main\n"
+               "b\trefs/helix-mirror/source/h/a/foo\n"
+               "c\trefs/tags/v1\n")
+        self.assertEqual(hr.parse_recorded_sources(out), {"h/a/foo"})
+
+    def destination(self, refs, source=("h", "orgB", "foo")):
+        row = "GSA/falcon-foo\tprivate\tfalse\n"
+        responses = [(0, row, ""), (0, refs, "")]
+        with patch.object(hr, "run", side_effect=lambda *a, **k: responses.pop(0)):
+            return hr.check_destination("github.com", "GSA", "falcon-foo", source=source, prefix="falcon-")
+
+    def test_different_recorded_source_is_a_mismatch(self):
+        state, problem = self.destination("a\trefs/heads/main\nb\trefs/helix-mirror/source/h/orga/foo\n")
+        self.assertIsNone(state)
+        self.assertIn("SOURCE MISMATCH", problem)
+        self.assertIn("h/orga/foo", problem)
+        self.assertIn("falcon-orgB-foo", problem)
+
+    def test_same_recorded_source_is_fine_whatever_the_case(self):
+        refs = "a\trefs/heads/main\nb\trefs/helix-mirror/source/h/orgb/foo\n"
+        self.assertEqual(self.destination(refs, source=("H", "OrgB", "Foo")), ("mirrored", None))
+
+    def test_unrecorded_legacy_mirror_is_not_refused(self):
+        self.assertEqual(self.destination("a\trefs/heads/main\n"), ("mirrored", None))
+
+    def test_source_ref_alone_does_not_make_a_mirror(self):
+        self.assertEqual(self.destination("b\trefs/helix-mirror/source/h/orgb/foo\n"), ("empty", None))
+
+
+class RequestAccessSourceTests(unittest.TestCase):
+    def run_request(self, remote_refs="", visible=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conflicts = Path(tmp.name) / "conflicts.txt"
+        conflicts.write_text("orgB/foo=falcon-foo\n", encoding="utf-8")
+        calls = []
+
+        def answer(command, env_host=None):
+            calls.append(command)
+            text = " ".join(command)
+            if "api user --jq" in text:
+                return (0, "bee\n", "")
+            if "ls-remote" in text:
+                return (0, remote_refs, "") if visible else (128, "", "fatal: could not read Username")
+            raise AssertionError(f"unexpected command: {text}")
+
+        err = io.StringIO()
+        with patch.object(hr, "run", side_effect=answer), contextlib.redirect_stderr(err):
+            code = hr.main(["request-access", "--repos-file", str(Path(tmp.name) / "repos.txt"),
+                            "--conflicts", str(conflicts), "--source-host", "h", "--access-repo", ""])
+        no_access = Path(tmp.name) / "no-access.txt"
+        return code, err.getvalue(), no_access
+
+    def test_other_sources_mirror_is_not_requested(self):
+        code, text, no_access = self.run_request("b\trefs/helix-mirror/source/h/orga/foo\n")
+        self.assertEqual(code, 0)
+        self.assertIn("SOURCE MISMATCH", text)
+        self.assertIn("falcon-orgB-foo", text)
+        self.assertNotIn("ACCESS NEEDED", text)
+        self.assertFalse(no_access.exists())
+
+    def test_known_matching_source_is_shown_in_the_request(self):
+        _, text, no_access = self.run_request("b\trefs/helix-mirror/source/h/orgb/foo\n")
+        self.assertIn("ACCESS NEEDED", text)
+        self.assertIn("mirror source: h/orgb/foo", text)
+        self.assertTrue(no_access.exists())
+
+    def test_invisible_mirror_is_requested_as_before(self):
+        _, text, no_access = self.run_request(visible=False)
+        self.assertIn("ACCESS NEEDED", text)
+        self.assertNotIn("mirror source", text)
 
 
 class FileAccessRequestTests(unittest.TestCase):
@@ -337,6 +531,39 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertFalse(no_access.exists())
         self.assertTrue((self.root / "home" / "falcon" / "falcon-taken").is_dir())
+
+    def test_mirror_records_its_source_and_refuses_a_different_one(self):
+        self.helix_repo("orgA", "foo")
+        result = self.run_kit("install.sh", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        gsa = self.root / "gsa" / "GSA" / "falcon-foo.git"
+        refs = self.git("--git-dir", str(gsa), "for-each-ref", "--format=%(refname)")
+        self.assertIn("refs/helix-mirror/source/localhost/orga/foo", refs.splitlines())
+
+        # Another user's Helix account sees only a different orgB/foo, which was
+        # given the same destination name; they can now see the GSA repository.
+        repos_file = self.root / "home" / ".config" / "helix-mirror" / "repos.txt"
+        repos_file.write_text("orgB/foo=falcon-foo\n", encoding="utf-8")
+        other = self.helix_repo("orgB", "foo")
+        before = self.gsa_head("falcon-foo")
+        result = self.run_kit("update.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SOURCE MISMATCH", result.stdout)
+        self.assertIn("falcon-orgB-foo", result.stdout)
+        self.assertEqual(self.gsa_head("falcon-foo"), before)
+        self.assertNotEqual(self.git("rev-parse", "HEAD", cwd=other), before)
+
+    def test_mirroring_into_a_destination_owned_by_another_source_is_refused(self):
+        self.helix_repo("orgA", "foo")
+        self.run_kit("install.sh", "--yes")
+        self.helix_repo("orgB", "foo")
+        gsa = self.root / "gsa" / "GSA" / "falcon-foo.git"
+        before = self.git("--git-dir", str(gsa), "for-each-ref")
+        result = self.run_kit("mirror-helix-to-github.sh", "--dest-org", "GSA", "--allow-nonempty",
+                              "orgB/foo=falcon-foo")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SOURCE MISMATCH", result.stdout)
+        self.assertEqual(self.git("--git-dir", str(gsa), "for-each-ref"), before)
 
 
 if __name__ == "__main__":
