@@ -13,7 +13,7 @@
 source "$(dirname "$0")/common.sh"
 
 case "${1:-}" in
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 check_prerequisites "$GITHUB_DEST_HOST"
