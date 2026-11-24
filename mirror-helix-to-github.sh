@@ -31,6 +31,9 @@
 #                         (default: one push, then automatic batched retry)
 #   --dry-run             clone + audit only: no repo creation, no push
 #   --allow-nonempty      push even if the destination repo already has refs
+#   --conflicts-out FILE  append "org/repo=dest" here for every destination
+#                         whose name is taken by a repo you cannot see,
+#                         instead of counting it as a failure
 #   -h | --help           this text
 #
 # Every destination, new or existing, must be confirmed private with no
@@ -64,6 +67,7 @@ MAX_BLOB_MB=100
 BATCH_SIZE=0
 DRY_RUN=0
 ALLOW_NONEMPTY=0
+CONFLICTS_OUT=""
 REPO_ARGS=()
 
 die() {
@@ -111,6 +115,7 @@ while [ "$#" -gt 0 ]; do
         --keep) KEEP=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --allow-nonempty) ALLOW_NONEMPTY=1; shift ;;
+        --conflicts-out) CONFLICTS_OUT="${2:?--conflicts-out needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         --) shift; while [ "$#" -gt 0 ]; do REPO_ARGS+=("$1"); shift; done ;;
         -*) die "unknown option: $1" ;;
@@ -487,13 +492,27 @@ for spec in "${REPO_ARGS[@]}"; do
         fi
     else
         log "    creating private repo $dest_full"
-        if ! GH_HOST="$DEST_HOST" gh repo create "$dest_full" --private >>"$repo_log" 2>&1; then
-            log "    gh repo create output:"
-            sed 's/^/        /' "$repo_log" | tail -10
-            repo_failed "gh repo create failed (token may lack org repo-creation rights)"
+        create_out="$(GH_HOST="$DEST_HOST" gh repo create "$dest_full" --private 2>&1)" || {
+            printf '%s\n' "$create_out" >>"$repo_log"
+            # The lookup above said "not found", yet the name is taken: the
+            # repository exists but this account has no access to it.
+            if printf '%s' "$create_out" | grep -qi 'already exists'; then
+                log "    NO ACCESS: $dest_full already exists but your account cannot see it"
+                if [ -n "$CONFLICTS_OUT" ]; then
+                    printf '%s/%s=%s\n' "$src_org" "$src_repo" "$dest_name" >>"$CONFLICTS_OUT"
+                    SUMMARY+=("NOACC $src_org/$src_repo -> $dest_full  (exists; you need access)")
+                else
+                    repo_failed "name taken: $dest_full exists but you have no access; ask its admin to add you"
+                fi
+            else
+                log "    gh repo create output:"
+                printf '%s\n' "$create_out" | sed 's/^/        /' | tail -10
+                repo_failed "gh repo create failed (token may lack org repo-creation rights)"
+            fi
             cd "$WORKDIR"
             continue
-        fi
+        }
+        printf '%s\n' "$create_out" >>"$repo_log"
     fi
 
     # Never push unless the destination is confirmed private, Pages-free and
