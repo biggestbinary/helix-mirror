@@ -640,6 +640,63 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("no Helix refs", output)
         self.assertIn("FAIL  app", output)
 
+    # -- source identity (HM-1) --
+
+    def record_gsa_source(self, source_id):
+        tip = self.gsa_tip()
+        run(["git", f"--git-dir={self.gsa}", "update-ref",
+             f"refs/helix-mirror/source/{source_id}", tip])
+
+    def test_matching_recorded_source_syncs(self):
+        self.record_gsa_source("helix.invalid/org/app")
+        self.commit_upstream("upstream change")
+        code, output = self.invoke("pull")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.helix_tip(), self.gsa_tip())
+
+    def test_mirror_of_another_helix_repo_is_refused_and_untouched(self):
+        self.record_gsa_source("helix.invalid/other-org/app")
+        self.commit_upstream("work from the wrong repository")
+        before = self.gsa_tip()
+        code, output = self.invoke("pull")
+        self.assertEqual(code, 1, output)
+        self.assertIn("SOURCE MISMATCH", output)
+        self.assertIn("helix.invalid/other-org/app", output)
+        self.assertEqual(self.gsa_tip(), before)
+
+    def test_unrecorded_mirror_with_unrelated_history_is_refused(self):
+        # An older mirror has no recorded source; a different repository shows up as no shared history.
+        other = self.root / "other"
+        run(["git", "init", "-q", str(other)])
+        run(["git", "config", "user.email", "t@example.invalid"], cwd=other)
+        run(["git", "config", "user.name", "Test"], cwd=other)
+        (other / "g").write_text("unrelated\n", encoding="utf-8")
+        run(["git", "add", "."], cwd=other)
+        run(["git", "commit", "-qm", "unrelated root"], cwd=other)
+        run(["git", "branch", "-M", "master"], cwd=other)
+        run(["git", "push", "-qf", str(self.helix), "master"], cwd=other)
+        before = self.gsa_tip()
+        code, output = self.invoke("pull")
+        self.assertEqual(code, 1, output)
+        self.assertIn("share no history", output)
+        self.assertEqual(self.gsa_tip(), before)
+
+    def test_push_to_helix_is_refused_for_a_mismatched_mirror(self):
+        self.invoke("status")
+        self.record_gsa_source("helix.invalid/other-org/app")
+        clone = self.into / "app"
+        run(["git", "config", "user.email", "t@example.invalid"], cwd=clone)
+        run(["git", "config", "user.name", "Test"], cwd=clone)
+        run(["git", "checkout", "-q", "-b", "feat/x"], cwd=clone)
+        (clone / "n").write_text("n\n", encoding="utf-8")
+        run(["git", "add", "."], cwd=clone)
+        run(["git", "commit", "-qm", "work"], cwd=clone)
+        code, output = self.invoke("push", "--branch", "feat/x")
+        self.assertEqual(code, 1, output)
+        self.assertIn("SOURCE MISMATCH", output)
+        branches = run(["git", f"--git-dir={self.helix}", "for-each-ref", "refs/heads"])
+        self.assertNotIn("feat/x", branches)
+
 
 class LockTests(unittest.TestCase):
     def test_second_lock_is_refused(self):
