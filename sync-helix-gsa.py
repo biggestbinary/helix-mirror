@@ -66,6 +66,10 @@ PREFLIGHT_TIMEOUT = 30
 # cannot rewrite or shadow tags an existing working clone already has.
 HELIX_TAG_NS = "refs/helix-tags"
 
+# mirror-helix-to-github.sh records which Helix repository a mirror was made
+# from in this namespace (one ref per source: <host>/<owner>/<repo>, lowercase).
+SOURCE_REF_PREFIX = "refs/helix-mirror/source/"
+
 
 def log(message):
     print(message, file=sys.stderr if JSON_MODE else sys.stdout, flush=True)
@@ -250,6 +254,63 @@ class Repo:
         if not dry_run and not problems:
             self.configure_helix_refspecs()
         return problems
+
+    def source_id(self):
+        return f"{self.config.source_host}/{self.src_org}/{self.src_repo}".lower()
+
+    def verify_source(self):
+        """Refuse to sync a mirror that was made from a different Helix repository.
+
+        Returns a list of problems (empty when fine). Two checks: the source
+        recorded on the GSA repository must match this spec; failing that, for
+        an older mirror with no recorded source, the branches of both sides
+        (fetched) must share a root commit.
+        """
+        code, out = git(
+            ["ls-remote", "origin", f"{SOURCE_REF_PREFIX}*"],
+            cwd=self.path, check=False, timeout=PREFLIGHT_TIMEOUT,
+        )
+        if code != 0:
+            return [f"cannot read the recorded source of {self.gsa_url}: {out.splitlines()[-1] if out else code}"]
+        recorded = set()
+        for line in out.splitlines():
+            _, _, ref = line.partition("\t")
+            if ref.startswith(SOURCE_REF_PREFIX):
+                recorded.add(ref[len(SOURCE_REF_PREFIX):])
+        if recorded and self.source_id() not in recorded:
+            return [
+                f"SOURCE MISMATCH: {self.config.dest_org}/{self.dest_name} is the mirror of "
+                f"{', '.join(sorted(recorded))}, not of {self.source_id()}; nothing was synced. "
+                "Give this Helix repository its own destination name in the repos file."
+            ]
+        if recorded:
+            return []
+        # An older mirror records no source, so prove the two sides share
+        # history: some root commit must be common to the branches of both,
+        # whatever their default branches are called. Missing refs are not a pass.
+        helix_roots = self.root_commits("refs/remotes/helix")
+        gsa_roots = self.root_commits("refs/remotes/origin")
+        if not gsa_roots:
+            return []  # nothing on GSA yet; nothing can be mixed
+        if not helix_roots:
+            return [
+                "no Helix refs locally, so the mirror's source cannot be verified; nothing was "
+                "synced (drop --no-fetch, or check Helix access)"
+            ]
+        if not helix_roots & gsa_roots:
+            return [
+                f"SOURCE MISMATCH: {self.src_org}/{self.src_repo} on Helix and "
+                f"{self.config.dest_org}/{self.dest_name} share no history, so the mirror "
+                "was not made from this repository; nothing was synced. Give this Helix "
+                "repository its own destination name in the repos file."
+            ]
+        return []
+
+    def root_commits(self, prefix):
+        _, out = git(
+            ["rev-list", "--max-parents=0", f"--glob={prefix}/*"], cwd=self.path, check=False
+        )
+        return set(out.split())
 
     def configure_helix_refspecs(self):
         """Keep Helix refs in their own namespaces.
@@ -665,6 +726,15 @@ def run_sync(args, config, repos, do_push):
                     results.append(record)
                     continue
 
+            mismatch = repo.verify_source()
+            if mismatch:
+                for problem in mismatch:
+                    log(f"    SKIP: {problem}")
+                record["problems"] = mismatch
+                failures += 1
+                results.append(record)
+                continue
+
             rows = repo.compare()
             tag_rows = repo.compare_tags()
             record["branches"] = rows
@@ -772,6 +842,19 @@ def run_push(args, config, repos):
         if error:
             log(f"    {error}")
             record["problems"].append(error)
+            return finish(1)
+    if not args.no_fetch and not args.dry_run:
+        error = repo.fetch("origin")
+        if error:
+            log(f"    {error}")
+            record["problems"].append(error)
+            return finish(1)
+    if not args.dry_run:
+        problems = repo.verify_source()
+        if problems:
+            for problem in problems:
+                log(f"    SKIP: {problem}")
+            record["problems"].extend(problems)
             return finish(1)
     error = repo.push_branch(args.branch, "helix", dry_run=args.dry_run)
     if error:

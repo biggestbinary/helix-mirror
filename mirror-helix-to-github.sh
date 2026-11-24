@@ -328,12 +328,45 @@ disable_destination_actions() {
         -F enabled=false >>"$repo_log" 2>&1
 }
 
+SOURCE_REF_PREFIX="refs/helix-mirror/source/"
+
+source_id() {
+    # Identity of the Helix repository, lowercased: host/org/repo.
+    printf '%s/%s/%s' "$SOURCE_HOST" "$1" "$2" | tr '[:upper:]' '[:lower:]'
+}
+
+record_source() {
+    # Stamp the mirror with the Helix repository it was made from, so a later
+    # run can refuse to sync a different repository into the same destination.
+    local sid="$1" tip
+    tip="$(git rev-parse --verify --quiet HEAD || git for-each-ref --count=1 --format='%(objectname)' refs/heads refs/tags)"
+    [ -n "$tip" ] || return 1
+    git update-ref "$SOURCE_REF_PREFIX$sid" "$tip"
+}
+
+destination_source_conflict() {
+    # $1 = expected source id, $2 = destination URL. Prints the recorded
+    # source(s) (or the git error) on stdout. Returns 0 when the destination
+    # records $1 or records nothing (an older mirror), 1 when it records
+    # another source, 2 when the source refs cannot be read: callers must
+    # then refuse to push.
+    local sid="$1" refs recorded
+    refs="$(git ls-remote "$2" "${SOURCE_REF_PREFIX}*" 2>&1)" || { printf '%s' "$refs" | tail -3; return 2; }
+    recorded="$(printf '%s\n' "$refs" | awk -v p="$SOURCE_REF_PREFIX" 'index($2, p) == 1 {print substr($2, length(p) + 1)}')"
+    [ -n "$recorded" ] || return 0
+    if ! printf '%s\n' "$recorded" | grep -qx -- "$sid"; then
+        printf '%s' "$recorded" | tr '\n' ' '
+        return 1
+    fi
+    return 0
+}
+
 push_in_batches() {
     # Push refs a batch at a time. GitHub rejects a single pack over ~2GB and
     # hundreds of refs in one push can also time out; batches keep each
     # request small and make a partial failure resumable.
     local url="$1" size="$2" refs=() total sent=0 batch
-    mapfile -t refs < <(git for-each-ref --format='%(refname)' refs/heads refs/tags)
+    mapfile -t refs < <(git for-each-ref --format='%(refname)' refs/heads refs/tags "$SOURCE_REF_PREFIX")
     total="${#refs[@]}"
     log "    pushing $total ref(s) in batches of $size"
     while [ "$sent" -lt "$total" ]; do
@@ -485,6 +518,17 @@ for spec in "${REPO_ARGS[@]}"; do
             cd "$WORKDIR"
             continue
         fi
+        source_status=0
+        other_source="$(destination_source_conflict "$(source_id "$src_org" "$src_repo")" "$dest_url")" || source_status=$?
+        if [ "$source_status" -eq 1 ]; then
+            repo_failed "SOURCE MISMATCH: $dest_full is the mirror of ${other_source% }, not of $(source_id "$src_org" "$src_repo"); use a different destination name"
+            cd "$WORKDIR"
+            continue
+        elif [ "$source_status" -ne 0 ]; then
+            repo_failed "could not read the recorded source of $dest_full ($other_source); refusing to push"
+            cd "$WORKDIR"
+            continue
+        fi
         if [ "$existing_refs" != "0" ] && [ "$ALLOW_NONEMPTY" -eq 0 ]; then
             repo_failed "destination already has $existing_refs ref(s); use --allow-nonempty"
             cd "$WORKDIR"
@@ -524,6 +568,12 @@ for spec in "${REPO_ARGS[@]}"; do
     fi
     if ! disable_destination_actions; then
         repo_failed "could not disable GitHub Actions on destination; refusing to push"
+        cd "$WORKDIR"
+        continue
+    fi
+
+    if ! record_source "$(source_id "$src_org" "$src_repo")" >>"$repo_log" 2>&1; then
+        repo_failed "could not record the Helix source on the mirror"
         cd "$WORKDIR"
         continue
     fi

@@ -99,20 +99,39 @@ the request again (and file it, if set up), run `./request-access.sh`.
 ## Giving someone access (repository admins)
 
 Only a repository's admins can add people. That's usually whoever mirrored it
-first, or a GSA org owner. To give a teammate's commercial github.com account
-access to every private `GSA/falcon-*` repository you administer, run:
+first, or a GSA org owner. Name the repositories to share; nothing is shared by
+default:
 
 ```bash
-./grant-access.sh                       # asks for the username
-./grant-access.sh --user octocat        # or give it directly
-./grant-access.sh --user octocat --repo falcon-app --repo falcon-infra   # only these
+./grant-access.sh --user octocat --repo falcon-app --repo falcon-infra
+./grant-access.sh --user octocat --all   # every mirror in your repos file that you administer; always asks
 ```
 
-The script checks that the account exists, lists the repositories, and asks
-before changing anything. The default permission is `push` (write); change it
-with `--permission pull|triage|push|maintain|admin`. Accounts outside the GSA
-org get an invitation they must accept. Repos you can't administer are
-skipped and reported.
+The script checks that the account exists **and is a member of the GSA org**,
+lists the repositories, and asks before changing anything (`--yes` is only
+accepted together with `--repo`). To share with an outside collaborator, add
+`--allow-outside-collaborator`; they get an invitation they must accept. The
+default permission is `pull` (read); raise it with
+`--permission pull|triage|push|maintain|admin`.
+
+Access is never lowered: if the person already has the requested level or more
+on a repository (or a custom role), it is reported as `already` and left alone.
+Repos you can't administer, or that are not in your repos file, are skipped and
+reported.
+
+## Mirror source identity
+
+When a mirror is created, the kit records which Helix repository it came from in
+the ref `refs/helix-mirror/source/<host>/<owner>/<repo>` on the GSA repository
+(the description stays blank). Before syncing, `plan`, `pull`, `status` and
+`push` refuse with `SOURCE MISMATCH` if the mirror records a different source,
+or, for mirrors made before this check existed, if `helix/<default>` and
+`origin/<default>` share no history. Nothing is pushed to either side in that
+case. The usual cause is two Helix repositories with the same name under
+different owners: change the destination of the one you can see to an
+owner-qualified name such as `falcon-<owner>-<repo>` in your repos file.
+`./request-access.sh` shows the recorded source of a mirror when it can be read
+and does not ask for access to another source's mirror.
 
 ## Safety rules
 
